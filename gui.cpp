@@ -17,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <initializer_list>
 
 // =====================================================================
 // 1. HỢP ĐỒNG DỮ LIỆU (đúng tên trường trong file "Quy ước kỹ thuật")
@@ -154,32 +155,111 @@ static void resetOutput(HWND hwnd) {
     InvalidateRect(hwnd, &kGantt, TRUE);
 }
 
+
+    // Hàm đọc CSV .
 static void openCsv(HWND hwnd) {
-    // TODO: khi TV5 xong, thay phần đọc này bằng hàm đọc CSV của TV5.
+    // Mở hộp thoại chọn file
     wchar_t path[MAX_PATH] = L"";
-    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"CSV (*.csv)\0*.csv\0"; ofn.Flags = OFN_FILEMUSTEXIST;
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"CSV (*.csv)\0*.csv\0";
+    ofn.Flags = OFN_FILEMUSTEXIST;
+
     if (!GetOpenFileNameW(&ofn)) return;
-    std::ifstream f{std::filesystem::path(path)};
-    if (!f) { msg(hwnd, "Không mở được file.", L"Lỗi đọc CSV", MB_ICONERROR); return; }
+
+    std::ifstream file{std::filesystem::path(path)};
     std::string line;
-    if (!std::getline(f, line) || trim(line).empty()) { msg(hwnd, "File rỗng.", L"Lỗi đọc CSV", MB_ICONERROR); return; }
-    if (line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB) line = line.substr(3);  // bỏ BOM
-    auto split = [](const std::string& s) { std::vector<std::string> v; std::string c; std::stringstream ss(s);
-        while (std::getline(ss, c, ',')) v.push_back(trim(c)); return v; };
-    auto cols = split(line);
-    auto idx = [&](const char* n) { for (size_t i = 0; i < cols.size(); ++i) if (cols[i] == n) return (int)i; return -1; };
-    int ip = idx("pid"), ia = idx("arrival_time"), ib = idx("burst_time");
-    if (ip < 0 || ia < 0 || ib < 0) {
-        std::string m = "Thiếu cột:"; if (ip < 0) m += " pid"; if (ia < 0) m += " arrival_time"; if (ib < 0) m += " burst_time";
-        msg(hwnd, m, L"Lỗi đọc CSV", MB_ICONERROR); return;
+
+    if (!file || !std::getline(file, line)) {
+        msg(hwnd, "Không đọc được file hoặc file rỗng.",
+            L"Lỗi CSV", MB_ICONERROR);
+        return;
     }
-    ListView_DeleteAllItems(hInList);
-    while (std::getline(f, line)) {                // giữ nguyên thứ tự dòng (dùng phân xử tie)
+
+    // Tách một dòng theo dấu phẩy
+    auto split = [](const std::string& text) {
+        std::vector<std::string> cells;
+        std::stringstream ss(text);
+        std::string cell;
+
+        while (std::getline(ss, cell, ',')) {
+            cells.push_back(trim(cell));
+        }
+        return cells;
+    };
+
+    // Bỏ BOM nếu file có
+    if (line.size() >= 3 &&
+        (unsigned char)line[0] == 0xEF &&
+        (unsigned char)line[1] == 0xBB &&
+        (unsigned char)line[2] == 0xBF) {
+        line.erase(0, 3);
+    }
+
+    // Tìm vị trí các cột trong dòng tiêu đề
+    auto headers = split(line);
+    auto findColumn = [&](const std::string& name) {
+        for (int i = 0; i < (int)headers.size(); ++i) {
+            if (headers[i] == name) return i;
+        }
+        return -1;
+    };
+
+    int pidCol = findColumn("pid");
+    int arrivalCol = findColumn("arrival_time");
+    int burstCol = findColumn("burst_time");
+
+    if (pidCol < 0 || arrivalCol < 0 || burstCol < 0) {
+        msg(hwnd, "CSV cần có cột pid, arrival_time, burst_time.",
+            L"Lỗi CSV", MB_ICONERROR);
+        return;
+    }
+
+    // Đọc từng dòng thành RawRow
+    std::vector<RawRow> rows;
+
+    while (std::getline(file, line)) {
         if (trim(line).empty()) continue;
-        auto p = split(line); auto at = [&](int i) { return i < (int)p.size() ? p[i] : std::string(); };
-        addRow(hInList, {W(at(ip)), W(at(ia)), W(at(ib))});
+
+        auto cells = split(line);
+        auto getCell = [&](int column) {
+            return column < (int)cells.size() ? cells[column] : "";
+        };
+
+        rows.push_back({
+            getCell(pidCol),
+            getCell(arrivalCol),
+            getCell(burstCol)
+        });
     }
+
+    // Dùng hàm validate() đã có trong code GUI
+    std::vector<Process> processes;
+    auto errors = validate(rows, processes);
+
+    if (!errors.empty()) {
+        std::string message;
+        for (const auto& error : errors)
+            message += error + "\n";
+
+        msg(hwnd, message, L"Dữ liệu không hợp lệ", MB_ICONERROR);
+        return;
+    }
+
+    // Đưa dữ liệu hợp lệ lên bảng GUI
+    ListView_DeleteAllItems(hInList);
+
+    for (const auto& p : processes) {
+        addRow(hInList, {
+            W(p.pid),
+            std::to_wstring(p.arrival_time),
+            std::to_wstring(p.burst_time)
+        });
+    }
+
     resetOutput(hwnd);
 }
 
@@ -205,20 +285,108 @@ static void run(HWND hwnd) {
     g_result = (SendMessageW(hAlgo, CB_GETCURSEL, 0, 0) == 0) ? run_fcfs(procs) : run_sjf(procs);
     g_has = true; fillTable(); InvalidateRect(hwnd, &kGantt, TRUE);
 }
+static void writeCsvRow(
+    std::ofstream& file,
+    std::initializer_list<std::string> cells
+) {
+    bool firstCell = true;
 
-static void exportCsv(HWND hwnd) {
-    if (!g_has) { msg(hwnd, "Hãy bấm Chạy trước.", L"Chưa có kết quả", MB_ICONINFORMATION); return; }
-    // TODO: khi TV5 xong, gọi hàm ghi CSV của TV5 thay cho đoạn này.
+    for (const auto& cell : cells) {
+        if (!firstCell) file << ",";
+        file << cell;
+        firstCell = false;
+    }
+
+    file << "\n";
+}
+
+static void writeScheduleResult(
+    std::ofstream& file,
+    const ScheduleResult& result
+) {
+    // Tên các cột
+    writeCsvRow(file, {
+        "record_type", "algorithm", "pid", "segment_type",
+        "start_time", "end_time", "arrival_time", "burst_time",
+        "completion_time", "waiting_time", "turnaround_time",
+        "response_time", "average_waiting_time",
+        "average_turnaround_time", "average_response_time"
+    });
+
+    // Các đoạn Gantt
+    for (const auto& s : result.segments) {
+        writeCsvRow(file, {
+            "SEGMENT",
+            result.algorithm,
+            s.pid,
+            s.type == Segment::PROCESS ? "PROCESS" : "IDLE",
+            std::to_string(s.start_time),
+            std::to_string(s.end_time),
+            "", "", "", "", "", "", "", "", ""
+        });
+    }
+
+    // Kết quả từng tiến trình
+    for (const auto& p : result.processes) {
+        writeCsvRow(file, {
+            "PROCESS", result.algorithm, p.pid,
+            "", "", "",
+            std::to_string(p.arrival_time),
+            std::to_string(p.burst_time),
+            std::to_string(p.completion_time),
+            std::to_string(p.waiting_time),
+            std::to_string(p.turnaround_time),
+            std::to_string(p.response_time),
+            "", "", ""
+        });
+    }
+
+    // Các giá trị trung bình
+    writeCsvRow(file, {
+        "AVERAGES", result.algorithm,
+        "", "", "", "", "", "", "", "", "", "",
+        std::to_string(result.averages.average_waiting_time),
+        std::to_string(result.averages.average_turnaround_time),
+        std::to_string(result.averages.average_response_time)
+    });
+}
+    //  hàm ghi CSV .
+    static void exportCsv(HWND hwnd) {
+    if (!g_has) {
+        msg(hwnd, "Hãy bấm Chạy trước.",
+            L"Chưa có kết quả", MB_ICONINFORMATION);
+        return;
+    }
+
     wchar_t path[MAX_PATH] = L"ketqua.csv";
-    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; ofn.lpstrFile = path; ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"CSV (*.csv)\0*.csv\0"; ofn.lpstrDefExt = L"csv"; ofn.Flags = OFN_OVERWRITEPROMPT;
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"CSV (*.csv)\0*.csv\0";
+    ofn.lpstrDefExt = L"csv";
+    ofn.Flags = OFN_OVERWRITEPROMPT;
+
     if (!GetSaveFileNameW(&ofn)) return;
-    std::ofstream o{std::filesystem::path(path)};
-    if (!o) { msg(hwnd, "Không ghi được file.", L"Lỗi", MB_ICONERROR); return; }
-    o << "pid,arrival_time,burst_time,start_time,completion_time,waiting_time,turnaround_time,response_time\n";
-    for (auto& p : g_result.processes)
-        o << p.pid << ',' << p.arrival_time << ',' << p.burst_time << ',' << p.start_time << ',' << p.completion_time << ','
-          << p.waiting_time << ',' << p.turnaround_time << ',' << p.response_time << '\n';
+
+    std::ofstream file{std::filesystem::path(path)};
+    if (!file) {
+        msg(hwnd, "Không ghi được file.",
+            L"Lỗi CSV", MB_ICONERROR);
+        return;
+    }
+
+    writeScheduleResult(file, g_result);
+
+    if (!file) {
+        msg(hwnd, "Có lỗi khi ghi CSV.",
+            L"Lỗi CSV", MB_ICONERROR);
+        return;
+    }
+
+    msg(hwnd, "Đã xuất kết quả CSV.",
+        L"Hoàn tất", MB_ICONINFORMATION);
 }
 
 // ---- Vẽ Gantt chart
