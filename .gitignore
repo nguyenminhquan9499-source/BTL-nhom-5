@@ -1,2 +1,6 @@
 *.exe
+*.ilk
+*.obj
+*.pdb
+fcfs_output.csv
 .vscode/
