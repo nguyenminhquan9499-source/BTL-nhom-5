@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="OS_Scheduling/OS_Scheduling.vcxproj" Id="198d8523-89b0-4d52-b18c-dae28db2b462" />
+</Solution>

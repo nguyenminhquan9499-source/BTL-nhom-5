@@ -1,4 +1,7 @@
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -15,13 +18,14 @@
 #include <functional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <initializer_list>
 
 // =====================================================================
-// 1. HỢP ĐỒNG DỮ LIỆU (đúng tên trường trong file "Quy ước kỹ thuật")
-//    Sau này TV2/TV3 dùng chung phần này (tách ra contract.h).
+// 1. HỢP ĐỒNG DỮ LIỆU 
 // =====================================================================
 struct Process { std::string pid; int arrival_time; int burst_time; };
 struct Segment { enum Type { PROCESS, IDLE } type; std::string pid; int start_time, end_time; };
@@ -38,43 +42,141 @@ struct ScheduleResult {
 };
 
 // =====================================================================
-// 2. THUẬT TOÁN TẠM (chỉ để thử giao diện).
-//    Khi TV2/TV3 xong: xóa phần này, #include file của họ (run_fcfs, run_sjf).
+// 2. THUẬT TOÁN FCFS VÀ SJF (cùng trả về ScheduleResult cho GUI).
 // =====================================================================
-static ScheduleResult simulateStub(const std::vector<Process>& ps, const std::string& name,
-        std::function<bool(const Process&, int, const Process&, int)> better) {
-    ScheduleResult r; r.algorithm = name;
-    int n = (int)ps.size(), t = 0, done = 0;
-    std::vector<bool> fin(n, false); std::vector<int> st(n), ct(n);
-    while (done < n) {
-        int pick = -1;
-        for (int i = 0; i < n; ++i)
-            if (!fin[i] && ps[i].arrival_time <= t && (pick < 0 || better(ps[i], i, ps[pick], pick))) pick = i;
-        if (pick < 0) {
-            int nxt = INT_MAX;
-            for (int i = 0; i < n; ++i) if (!fin[i]) nxt = std::min(nxt, ps[i].arrival_time);
-            r.segments.push_back({Segment::IDLE, "", t, nxt}); t = nxt; continue;
-        }
-        r.segments.push_back({Segment::PROCESS, ps[pick].pid, t, t + ps[pick].burst_time});
-        st[pick] = t; t += ps[pick].burst_time; ct[pick] = t; fin[pick] = true; ++done;
-    }
-    double w = 0, ta = 0, rs = 0;
-    for (int i = 0; i < n; ++i) {
-        ProcessResult p{ps[i].pid, ps[i].arrival_time, ps[i].burst_time, st[i], ct[i],
-                        st[i] - ps[i].arrival_time, ct[i] - ps[i].arrival_time, st[i] - ps[i].arrival_time};
-        w += p.waiting_time; ta += p.turnaround_time; rs += p.response_time; r.processes.push_back(p);
-    }
-    r.averages = {w / n, ta / n, rs / n};
-    return r;
-}
 static ScheduleResult run_fcfs(const std::vector<Process>& ps) {
-    return simulateStub(ps, "FCFS", [](const Process& a, int i, const Process& b, int j) {
-        return a.arrival_time != b.arrival_time ? a.arrival_time < b.arrival_time : i < j; });
+    if (ps.empty()) throw std::invalid_argument("Chưa có tiến trình để lập lịch.");
+    ScheduleResult result;
+    result.algorithm = "FCFS";
+
+    // Sắp theo arrival; stable_sort giữ thứ tự CSV khi arrival bằng nhau.
+    std::vector<size_t> order(ps.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+        return ps[left].arrival_time < ps[right].arrival_time;
+    });
+
+    std::vector<ProcessResult> byInputOrder(ps.size());
+    long long currentTime = 0;
+    long double totalWaiting = 0, totalTurnaround = 0, totalResponse = 0;
+    for (size_t index : order) {
+        const Process& p = ps[index];
+        if (currentTime < p.arrival_time) {
+            result.segments.push_back({Segment::IDLE, "", (int)currentTime, p.arrival_time});
+            currentTime = p.arrival_time;
+        }
+        const long long start = currentTime;
+        const long long completion = start + p.burst_time;
+        if (start > INT_MAX || completion > INT_MAX)
+            throw std::overflow_error("Tổng thời gian mô phỏng vượt giới hạn; hãy dùng dữ liệu nhỏ hơn.");
+
+        const int waiting = (int)(start - p.arrival_time);
+        const int turnaround = (int)(completion - p.arrival_time);
+        const int response = waiting; // CPU burst không bị ngắt nên response = waiting.
+        result.segments.push_back({Segment::PROCESS, p.pid, (int)start, (int)completion});
+        byInputOrder[index] = {p.pid, p.arrival_time, p.burst_time, (int)start,
+                               (int)completion, waiting, turnaround, response};
+        totalWaiting += waiting;
+        totalTurnaround += turnaround;
+        totalResponse += response;
+        currentTime = completion;
+    }
+
+    // Bảng kết quả giữ thứ tự dòng CSV để dễ đối chiếu với dữ liệu nhập.
+    result.processes = std::move(byInputOrder);
+    const long double count = static_cast<long double>(result.processes.size());
+    result.averages = {(double)(totalWaiting / count),
+                       (double)(totalTurnaround / count),
+                       (double)(totalResponse / count)};
+    return result;
 }
+
+// SJF không độc quyền: mỗi lần CPU rảnh, chọn tiến trình đã đến
+// có burst nhỏ nhất; tie theo arrival time rồi thứ tự dòng input.
 static ScheduleResult run_sjf(const std::vector<Process>& ps) {
-    return simulateStub(ps, "SJF", [](const Process& a, int i, const Process& b, int j) {
-        if (a.burst_time != b.burst_time) return a.burst_time < b.burst_time;
-        return a.arrival_time != b.arrival_time ? a.arrival_time < b.arrival_time : i < j; });
+    if (ps.empty()) throw std::invalid_argument("Chưa có tiến trình để lập lịch.");
+
+    ScheduleResult result;
+    result.algorithm = "SJF";
+    std::vector<bool> finished(ps.size(), false);
+    std::vector<ProcessResult> byInputOrder(ps.size());
+    size_t completedCount = 0;
+    long long currentTime = 0;
+    long double totalWaiting = 0, totalTurnaround = 0, totalResponse = 0;
+
+    while (completedCount < ps.size()) {
+        int selected = -1;
+
+        // Chỉ xét tiến trình đã đến; chỉ số vector là thứ tự dòng CSV.
+        for (size_t i = 0; i < ps.size(); ++i) {
+            if (finished[i] || ps[i].arrival_time > currentTime) continue;
+            if (selected < 0) {
+                selected = static_cast<int>(i);
+                continue;
+            }
+
+            const Process& candidate = ps[i];
+            const Process& currentBest = ps[static_cast<size_t>(selected)];
+            const bool better =
+                candidate.burst_time < currentBest.burst_time ||
+                (candidate.burst_time == currentBest.burst_time &&
+                 candidate.arrival_time < currentBest.arrival_time) ||
+                (candidate.burst_time == currentBest.burst_time &&
+                 candidate.arrival_time == currentBest.arrival_time &&
+                 i < static_cast<size_t>(selected));
+            if (better) selected = static_cast<int>(i);
+        }
+
+        if (selected < 0) {
+            // Không có tiến trình sẵn sàng: CPU idle đến arrival gần nhất còn lại.
+            bool foundArrival = false;
+            int nextArrival = INT_MAX;
+            for (size_t i = 0; i < ps.size(); ++i) {
+                if (!finished[i] && (!foundArrival || ps[i].arrival_time < nextArrival)) {
+                    nextArrival = ps[i].arrival_time;
+                    foundArrival = true;
+                }
+            }
+            if (!foundArrival)
+                throw std::logic_error("Không tìm được tiến trình tiếp theo.");
+            if (currentTime > INT_MAX)
+                throw std::overflow_error("Tổng thời gian mô phỏng vượt giới hạn kiểu int.");
+            if (currentTime < nextArrival) {
+                result.segments.push_back({Segment::IDLE, "", static_cast<int>(currentTime), nextArrival});
+                currentTime = nextArrival;
+            }
+            continue;
+        }
+
+        const size_t index = static_cast<size_t>(selected);
+        const Process& p = ps[index];
+        const long long start = currentTime;
+        const long long completion = start + p.burst_time;
+        if (start > INT_MAX || completion > INT_MAX)
+            throw std::overflow_error("Tổng thời gian mô phỏng vượt giới hạn; hãy dùng dữ liệu nhỏ hơn.");
+
+        const int waiting = static_cast<int>(start - p.arrival_time);
+        const int turnaround = static_cast<int>(completion - p.arrival_time);
+        const int response = waiting; // Một CPU burst, không bị ngắt.
+        result.segments.push_back({Segment::PROCESS, p.pid,
+                                   static_cast<int>(start), static_cast<int>(completion)});
+        byInputOrder[index] = {p.pid, p.arrival_time, p.burst_time,
+                               static_cast<int>(start), static_cast<int>(completion),
+                               waiting, turnaround, response};
+        totalWaiting += waiting;
+        totalTurnaround += turnaround;
+        totalResponse += response;
+        currentTime = completion; // Chạy đến hết rồi mới chọn tiến trình kế tiếp.
+        finished[index] = true;
+        ++completedCount;
+    }
+
+    result.processes = std::move(byInputOrder); // Trả bảng theo thứ tự input/CSV.
+    const long double count = static_cast<long double>(result.processes.size());
+    result.averages = {static_cast<double>(totalWaiting / count),
+                       static_cast<double>(totalTurnaround / count),
+                       static_cast<double>(totalResponse / count)};
+    return result;
 }
 
 // =====================================================================
@@ -181,13 +283,27 @@ static void openCsv(HWND hwnd) {
 
     // Tách một dòng theo dấu phẩy
     auto split = [](const std::string& text) {
+        // Đọc CSV có dấu ngoặc kép và dấu phẩy nằm bên trong trường.
         std::vector<std::string> cells;
-        std::stringstream ss(text);
         std::string cell;
-
-        while (std::getline(ss, cell, ',')) {
-            cells.push_back(trim(cell));
+        bool quoted = false;
+        for (size_t i = 0; i < text.size(); ++i) {
+            const char ch = text[i];
+            if (ch == '"') {
+                if (quoted && i + 1 < text.size() && text[i + 1] == '"') {
+                    cell += '"';
+                    ++i;
+                } else {
+                    quoted = !quoted;
+                }
+            } else if (ch == ',' && !quoted) {
+                cells.push_back(trim(cell));
+                cell.clear();
+            } else {
+                cell += ch;
+            }
         }
+        cells.push_back(trim(cell));
         return cells;
     };
 
@@ -282,21 +398,37 @@ static void run(HWND hwnd) {
         rows.push_back({cellText(hInList, r, 0), cellText(hInList, r, 1), cellText(hInList, r, 2)});
     std::vector<Process> procs; auto errs = validate(rows, procs);
     if (!errs.empty()) { std::string m; for (auto& e : errs) m += e + "\n"; msg(hwnd, m, L"Dữ liệu không hợp lệ", MB_ICONERROR); return; }
-    g_result = (SendMessageW(hAlgo, CB_GETCURSEL, 0, 0) == 0) ? run_fcfs(procs) : run_sjf(procs);
-    g_has = true; fillTable(); InvalidateRect(hwnd, &kGantt, TRUE);
+    try {
+        g_result = (SendMessageW(hAlgo, CB_GETCURSEL, 0, 0) == 0) ? run_fcfs(procs) : run_sjf(procs);
+        g_has = true;
+        fillTable();
+        InvalidateRect(hwnd, &kGantt, TRUE);
+    } catch (const std::exception& e) {
+        resetOutput(hwnd);
+        msg(hwnd, e.what(), L"Chưa chạy được thuật toán", MB_ICONINFORMATION);
+    }
 }
+static std::string csvEscape(const std::string& value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) return value;
+    std::string escaped = "\"";
+    for (char ch : value) {
+        if (ch == '\"') escaped += "\"\"";
+        else escaped += ch;
+    }
+    escaped += "\"";
+    return escaped;
+}
+
 static void writeCsvRow(
     std::ofstream& file,
     std::initializer_list<std::string> cells
 ) {
     bool firstCell = true;
-
     for (const auto& cell : cells) {
         if (!firstCell) file << ",";
-        file << cell;
+        file << csvEscape(cell);
         firstCell = false;
     }
-
     file << "\n";
 }
 
@@ -330,7 +462,7 @@ static void writeScheduleResult(
     for (const auto& p : result.processes) {
         writeCsvRow(file, {
             "PROCESS", result.algorithm, p.pid,
-            "", "", "",
+            "", std::to_string(p.start_time), "",
             std::to_string(p.arrival_time),
             std::to_string(p.burst_time),
             std::to_string(p.completion_time),
@@ -487,3 +619,4 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int show) {
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     return 0;
 }
+
