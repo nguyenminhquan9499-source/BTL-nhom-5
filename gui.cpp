@@ -182,15 +182,42 @@ static ScheduleResult run_sjf(const std::vector<Process>& ps) {
 // =====================================================================
 // 3. TIỆN ÍCH + KIỂM TRA DỮ LIỆU NHẬP
 // =====================================================================
-static std::wstring W(const std::string& s) {           // UTF-8 -> wstring
+static std::wstring W(const std::string& s) {
     if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring w(n - 1, L'\0'); MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n); return w;
+
+    int size = MultiByteToWideChar(
+        CP_UTF8, 0, s.c_str(), -1, nullptr, 0
+    );
+    if (size <= 0) return L"";
+
+    std::wstring result(size, L'\0');
+
+    int written = MultiByteToWideChar(
+        CP_UTF8, 0, s.c_str(), -1, &result[0], size
+    );
+    if (written <= 0) return L"";
+
+    result.resize(written - 1);
+    return result;
 }
-static std::string U(const std::wstring& w) {           // wstring -> UTF-8
+
+static std::string U(const std::wstring& w) {
     if (w.empty()) return "";
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string s(n - 1, '\0'); WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr); return s;
+
+    int size = WideCharToMultiByte(
+        CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr
+    );
+    if (size <= 0) return "";
+
+    std::string result(size, '\0');
+
+    int written = WideCharToMultiByte(
+        CP_UTF8, 0, w.c_str(), -1, &result[0], size, nullptr, nullptr
+    );
+    if (written <= 0) return "";
+
+    result.resize(written - 1);
+    return result;
 }
 static std::string trim(const std::string& s) {
     size_t b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
@@ -217,7 +244,140 @@ static std::vector<std::string> validate(const std::vector<RawRow>& rows, std::v
     }
     return err;
 }
+// =====================================================================
+// Hàm đọc tiến trình từ file CSV
+// =====================================================================
+// Tách một dòng CSV, hỗ trợ dấu phẩy và ngoặc kép trong ô.
+static bool parseCsvRow(
+    const std::string& text,
+    std::vector<std::string>& cells
+) {
+    cells.clear();
 
+    std::string cell;
+    bool quoted = false;
+    bool closedQuote = false;
+
+    for (size_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
+
+        if (quoted) {
+            if (ch == '"') {
+                // Hai dấu "" liên tiếp bên trong ô có nghĩa là một dấu "
+                if (i + 1 < text.size() && text[i + 1] == '"') {
+                    cell += '"';
+                    ++i;
+                } else {
+                    quoted = false;
+                    closedQuote = true;
+                }
+            } else {
+                cell += ch;
+            }
+        } else if (ch == ',') {
+            cells.push_back(trim(cell));
+            cell.clear();
+            closedQuote = false;
+        } else if (ch == '"' && trim(cell).empty() && !closedQuote) {
+            cell.clear();
+            quoted = true;
+        } else if (closedQuote && ch != ' ' && ch != '\t') {
+            return false;
+        } else if (!closedQuote) {
+            cell += ch;
+        }
+    }
+
+    if (quoted) return false;  // Dấu ngoặc kép mở nhưng chưa đóng
+
+    cells.push_back(trim(cell));
+    return true;
+}
+
+// Đọc CSV và kiểm tra dữ liệu. GUI và Test.cpp đều gọi hàm này.
+static bool readCsvProcesses(
+    const std::filesystem::path& path,
+    std::vector<Process>& processes,
+    std::vector<std::string>& errors
+) {
+    processes.clear();
+    errors.clear();
+
+    std::ifstream file(path, std::ios::binary);
+    std::string line;
+
+    if (!file || !std::getline(file, line)) {
+        errors.push_back("Không đọc được file hoặc file rỗng.");
+        return false;
+    }
+
+    // Bỏ UTF-8 BOM nếu file có.
+    if (line.size() >= 3 &&
+        (unsigned char)line[0] == 0xEF &&
+        (unsigned char)line[1] == 0xBB &&
+        (unsigned char)line[2] == 0xBF) {
+        line.erase(0, 3);
+    }
+
+    std::vector<std::string> headers;
+    if (!parseCsvRow(line, headers)) {
+        errors.push_back("Dòng tiêu đề CSV có dấu ngoặc kép sai.");
+        return false;
+    }
+
+    int pidCol = -1;
+    int arrivalCol = -1;
+    int burstCol = -1;
+
+    for (int i = 0; i < (int)headers.size(); ++i) {
+        if (headers[i] == "pid") pidCol = i;
+        if (headers[i] == "arrival_time") arrivalCol = i;
+        if (headers[i] == "burst_time") burstCol = i;
+    }
+
+    if (pidCol < 0 || arrivalCol < 0 || burstCol < 0) {
+        errors.push_back("CSV cần có cột pid, arrival_time, burst_time.");
+        return false;
+    }
+
+    std::vector<RawRow> rows;
+    int lineNumber = 1;
+
+    while (std::getline(file, line)) {
+        ++lineNumber;
+
+        if (trim(line).empty())
+            continue;
+
+        std::vector<std::string> cells;
+        if (!parseCsvRow(line, cells)) {
+            errors.push_back(
+                "Dòng " + std::to_string(lineNumber) +
+                " có dấu ngoặc kép sai."
+            );
+            return false;
+        }
+
+        auto getCell = [&](int column) {
+            return column < (int)cells.size()
+                ? cells[column]
+                : std::string();
+        };
+
+        rows.push_back({
+            getCell(pidCol),
+            getCell(arrivalCol),
+            getCell(burstCol)
+        });
+    }
+
+    errors = validate(rows, processes);
+
+    if (!errors.empty())
+        processes.clear();
+
+    return errors.empty();
+}
 // =====================================================================
 // 4. GUI
 // =====================================================================
@@ -260,8 +420,9 @@ static void resetOutput(HWND hwnd) {
 
     // Hàm đọc CSV .
 static void openCsv(HWND hwnd) {
-    // Mở hộp thoại chọn file
+    // Mở hộp thoại để chọn file CSV
     wchar_t path[MAX_PATH] = L"";
+
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
@@ -272,100 +433,26 @@ static void openCsv(HWND hwnd) {
 
     if (!GetOpenFileNameW(&ofn)) return;
 
-    std::ifstream file{std::filesystem::path(path)};
-    std::string line;
-
-    if (!file || !std::getline(file, line)) {
-        msg(hwnd, "Không đọc được file hoặc file rỗng.",
-            L"Lỗi CSV", MB_ICONERROR);
-        return;
-    }
-
-    // Tách một dòng theo dấu phẩy
-    auto split = [](const std::string& text) {
-        // Đọc CSV có dấu ngoặc kép và dấu phẩy nằm bên trong trường.
-        std::vector<std::string> cells;
-        std::string cell;
-        bool quoted = false;
-        for (size_t i = 0; i < text.size(); ++i) {
-            const char ch = text[i];
-            if (ch == '"') {
-                if (quoted && i + 1 < text.size() && text[i + 1] == '"') {
-                    cell += '"';
-                    ++i;
-                } else {
-                    quoted = !quoted;
-                }
-            } else if (ch == ',' && !quoted) {
-                cells.push_back(trim(cell));
-                cell.clear();
-            } else {
-                cell += ch;
-            }
-        }
-        cells.push_back(trim(cell));
-        return cells;
-    };
-
-    // Bỏ BOM nếu file có
-    if (line.size() >= 3 &&
-        (unsigned char)line[0] == 0xEF &&
-        (unsigned char)line[1] == 0xBB &&
-        (unsigned char)line[2] == 0xBF) {
-        line.erase(0, 3);
-    }
-
-    // Tìm vị trí các cột trong dòng tiêu đề
-    auto headers = split(line);
-    auto findColumn = [&](const std::string& name) {
-        for (int i = 0; i < (int)headers.size(); ++i) {
-            if (headers[i] == name) return i;
-        }
-        return -1;
-    };
-
-    int pidCol = findColumn("pid");
-    int arrivalCol = findColumn("arrival_time");
-    int burstCol = findColumn("burst_time");
-
-    if (pidCol < 0 || arrivalCol < 0 || burstCol < 0) {
-        msg(hwnd, "CSV cần có cột pid, arrival_time, burst_time.",
-            L"Lỗi CSV", MB_ICONERROR);
-        return;
-    }
-
-    // Đọc từng dòng thành RawRow
-    std::vector<RawRow> rows;
-
-    while (std::getline(file, line)) {
-        if (trim(line).empty()) continue;
-
-        auto cells = split(line);
-        auto getCell = [&](int column) {
-            return column < (int)cells.size() ? cells[column] : "";
-        };
-
-        rows.push_back({
-            getCell(pidCol),
-            getCell(arrivalCol),
-            getCell(burstCol)
-        });
-    }
-
-    // Dùng hàm validate() đã có trong code GUI
+    // Đọc và kiểm tra dữ liệu trong file
     std::vector<Process> processes;
-    auto errors = validate(rows, processes);
+    std::vector<std::string> errors;
 
-    if (!errors.empty()) {
+    if (!readCsvProcesses(
+            std::filesystem::path(path),
+            processes,
+            errors
+        )) {
         std::string message;
-        for (const auto& error : errors)
-            message += error + "\n";
 
-        msg(hwnd, message, L"Dữ liệu không hợp lệ", MB_ICONERROR);
+        for (const auto& error : errors) {
+            message += error + "\n";
+        }
+
+        msg(hwnd, message, L"Lỗi đọc CSV", MB_ICONERROR);
         return;
     }
 
-    // Đưa dữ liệu hợp lệ lên bảng GUI
+    // Đưa dữ liệu hợp lệ lên bảng trong GUI
     ListView_DeleteAllItems(hInList);
 
     for (const auto& p : processes) {
@@ -378,7 +465,6 @@ static void openCsv(HWND hwnd) {
 
     resetOutput(hwnd);
 }
-
 static void fillTable() {
     ListView_DeleteAllItems(hResList);
     for (auto& p : g_result.processes)
